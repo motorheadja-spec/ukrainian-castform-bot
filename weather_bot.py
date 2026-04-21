@@ -324,7 +324,7 @@ async def main() -> None:
         await m.answer(text, parse_mode="Markdown")
 
     scheduler = AsyncIOScheduler(timezone="Europe/Kiev")
-    scheduler.add_job(send_weather, "cron", hour=9, minute=0, args=[bot])
+    scheduler.add_job(send_weather, "cron", hour=7, minute=0, args=[bot])
     scheduler.start()
 
     logging.info("Bot started. Weather daily at 09:00 Kyiv time.")
