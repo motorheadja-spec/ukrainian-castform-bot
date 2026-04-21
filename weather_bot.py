@@ -1,5 +1,6 @@
 # weather_bot.py
 import asyncio
+import json
 import logging
 import os
 import random
@@ -17,46 +18,33 @@ Telegram бот: щоденна погода по містах України о
 
 Потрібні змінні в .env:
   BOT_TOKEN         — токен Telegram бота
-  CHAT_ID           — ID чату куди слати погоду
+  CHAT_ID           — ID групи (наприклад -1002800599714)
+  TOPIC_ID          — ID топіку в групі (наприклад 6)
   OPENWEATHER_KEY   — ключ OpenWeatherMap API (безкоштовний)
 
-Запуск:
-  pip install aiogram httpx apscheduler python-dotenv
-  python weather_bot.py
+Режими:
+  - О 9:00 автоматично пише погоду в топік групи
+  - /start в особистих — підписує користувача на особисті повідомлення
+  - /weather в особистих або групі — погода на запит
 """
 
 load_dotenv()
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
 CHAT_ID_RAW     = os.getenv("CHAT_ID")
+TOPIC_ID_RAW    = os.getenv("TOPIC_ID")
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
 
+SUBSCRIBERS_FILE = "subscribers.json"
+
 CITIES = [
-    "Вінниця",
-    "Луцьк",
-    "Дніпро",
-    "Житомир",
-    "Ужгород",
-    "Запоріжжя",
-    "Івано-Франківськ",
-    "Київ",
-    "Кропивницький",
-    "Львів",
-    "Миколаїв",
-    "Одеса",
-    "Полтава",
-    "Рівне",
-    "Суми",
-    "Тернопіль",
-    "Харків",
-    "Херсон",
-    "Хмельницький",
-    "Черкаси",
-    "Чернівці",
-    "Чернігів",
+    "Вінниця", "Луцьк", "Дніпро", "Житомир", "Ужгород",
+    "Запоріжжя", "Івано-Франківськ", "Київ", "Кропивницький",
+    "Львів", "Миколаїв", "Одеса", "Полтава", "Рівне",
+    "Суми", "Тернопіль", "Харків", "Херсон", "Хмельницький",
+    "Черкаси", "Чернівці", "Чернігів",
 ]
 
-# Жарти по типу погоди
 COMMENTS = {
     "sunny": [
         "сонцезахисні окуляри обовʼязкові",
@@ -89,7 +77,7 @@ COMMENTS = {
         "куртку вдягни про всяк випадок",
         "не дощ але й не свято",
         "небо в режимі енергозбереження",
-        "сонце в відпустці, хмари на чергуванні",
+        "сонце у відпустці, хмари на чергуванні",
         "парасолька в сумці не завадить",
         "фото сьогодні вийдуть без тіней",
         "типовий день — типовий настрій",
@@ -204,6 +192,30 @@ def condition_emoji(weather_id: int) -> str:
         return "☁️"
 
 
+# ---------- subscribers ----------
+def load_subscribers() -> list:
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return []
+    try:
+        with open(SUBSCRIBERS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_subscribers(subs: list) -> None:
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(subs, f)
+
+def add_subscriber(user_id: int) -> bool:
+    subs = load_subscribers()
+    if user_id not in subs:
+        subs.append(user_id)
+        save_subscribers(subs)
+        return True
+    return False
+
+
+# ---------- weather ----------
 async def fetch_weather(city: str) -> dict | None:
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
@@ -216,49 +228,68 @@ async def fetch_weather(city: str) -> dict | None:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, params=params)
             if resp.status_code != 200:
-                logging.warning(f"OpenWeather {resp.status_code} for {city}")
                 return None
             data = resp.json()
             weather_id = data["weather"][0]["id"]
             return {
-                "city":      city,
-                "temp":      round(data["main"]["temp"]),
-                "emoji":     condition_emoji(weather_id),
-                "comment":   get_comment(weather_id),
+                "city":    city,
+                "temp":    round(data["main"]["temp"]),
+                "emoji":   condition_emoji(weather_id),
+                "comment": get_comment(weather_id),
             }
     except Exception as e:
         logging.error(f"fetch_weather error for {city}: {e}")
         return None
-
 
 async def fetch_all_weather() -> list[dict]:
     tasks   = [fetch_weather(city) for city in CITIES]
     results = await asyncio.gather(*tasks)
     return [r for r in results if r is not None]
 
+def build_weather_text(weather_data: list[dict]) -> str:
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    lines    = [f"🌍 Погода по Україні, {date_str}\n"]
+    for w in weather_data:
+        lines.append(f"**{w['city']}** {w['temp']}° {w['emoji']} — {w['comment']}")
+    return "\n".join(lines)
 
+
+# ---------- send ----------
 async def send_weather(bot: Bot) -> None:
     logging.info("Fetching weather...")
     weather_data = await fetch_all_weather()
-
     if not weather_data:
-        logging.error("No weather data received")
+        logging.error("No weather data")
         return
 
-    date_str = datetime.now().strftime("%d.%m.%Y")
-    lines = [f"🌍 Погода по Україні, {date_str}\n"]
+    text = build_weather_text(weather_data)
 
-    for w in weather_data:
-        lines.append(f"**{w['city']}** {w['temp']}° {w['emoji']} — {w['comment']}")
+    # Надсилаємо в топік групи
+    try:
+        await bot.send_message(
+            chat_id=int(CHAT_ID_RAW),
+            text=text,
+            parse_mode="Markdown",
+            message_thread_id=int(TOPIC_ID_RAW),
+        )
+        logging.info("Weather sent to group topic")
+    except Exception as e:
+        logging.error(f"Error sending to group: {e}")
 
-    text = "\n".join(lines)
+    # Надсилаємо особисто всім підписникам
+    subs = load_subscribers()
+    for user_id in subs:
+        try:
+            await bot.send_message(user_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logging.warning(f"Error sending to {user_id}: {e}")
 
-    await bot.send_message(int(CHAT_ID_RAW), text, parse_mode="Markdown")
-    logging.info(f"Weather sent for {len(weather_data)} cities")
+    logging.info(f"Weather sent to {len(subs)} subscribers")
 
 
+# ---------- main ----------
 async def main() -> None:
-    if not all([BOT_TOKEN, CHAT_ID_RAW, OPENWEATHER_KEY]):
+    if not all([BOT_TOKEN, CHAT_ID_RAW, TOPIC_ID_RAW, OPENWEATHER_KEY]):
         logging.error("Не всі змінні задані в .env")
         return
 
@@ -269,22 +300,34 @@ async def main() -> None:
 
     @dp.message(Command("start"))
     async def start_cmd(m: Message):
-        await m.answer(
-            "☀️ Бот погоди запущено!\n"
-            "Щодня о 9:00 надсилаю погоду по Україні.\n"
-            "Команда /weather — отримати зараз."
-        )
+        if m.chat.type == "private":
+            is_new = add_subscriber(m.from_user.id)
+            if is_new:
+                await m.answer(
+                    "✅ Підписався! Щодня о 9:00 буду надсилати погоду особисто.\n"
+                    "Команда /weather — отримати погоду зараз."
+                )
+            else:
+                await m.answer(
+                    "Ти вже підписаний! 👍\n"
+                    "Команда /weather — отримати погоду зараз."
+                )
 
     @dp.message(Command("weather"))
     async def weather_cmd(m: Message):
         await m.answer("🔎 Збираю погоду, зачекай...")
-        await send_weather(bot)
+        weather_data = await fetch_all_weather()
+        if not weather_data:
+            await m.answer("❌ Не вдалось отримати погоду, спробуй пізніше.")
+            return
+        text = build_weather_text(weather_data)
+        await m.answer(text, parse_mode="Markdown")
 
     scheduler = AsyncIOScheduler(timezone="Europe/Kiev")
     scheduler.add_job(send_weather, "cron", hour=9, minute=0, args=[bot])
     scheduler.start()
 
-    logging.info("Bot started. Weather will be sent daily at 09:00 Kyiv time.")
+    logging.info("Bot started. Weather daily at 09:00 Kyiv time.")
     await dp.start_polling(bot)
 
 
@@ -292,4 +335,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Stopped by KeyboardInterrupt")
+        logging.info("Stopped")
